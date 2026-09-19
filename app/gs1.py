@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass
+from decimal import Decimal
 
 GS = "\x1d"  # ASCII 29 <GS>, transmitted as FNC1 by scanners
 
@@ -380,22 +381,21 @@ def _apply_semantics(spec: AISpec, value: str, offsets):
     return None, None
 
 
-def _decode_weight(value: str, spec: AISpec) -> float:
-    """Interpret the 6 fixed digits with ``spec.decimals`` implied places.
+def decode_weight(value: str, decimals: int) -> Decimal:
+    """Interpret the 6 fixed digits with ``decimals`` implied places exactly.
 
     The GS1 variable-metric rule is ``int(digits) / 10**n``; when n > 6
     the missing high-order fractional digits are implied zero, e.g.
-    ``3109 000001`` -> 0.000000001 kg.
+    ``3109 000001`` -> Decimal('0.000000001').  The result is built from
+    the integer digits and a power of ten, so no binary float is ever
+    involved.
     """
-    n = spec.decimals
-    if n == 0:
-        return float(value)
-    if n <= 6:
-        integer = value[: 6 - n] or "0"
-        text = f"{integer}.{value[6 - n :]}"
-    else:
-        text = f"0.{'0' * (n - 6)}{value}"
-    return float(text)
+    return Decimal(int(value)).scaleb(-decimals)
+
+
+def _decode_weight(value: str, spec: AISpec) -> float:
+    """Float view of :func:`decode_weight` for the ``decimal_value`` field."""
+    return float(decode_weight(value, spec.decimals))
 
 
 # ------------------------------------------------------------ Digital Link URIs
