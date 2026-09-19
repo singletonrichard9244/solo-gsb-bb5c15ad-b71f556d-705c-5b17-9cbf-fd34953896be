@@ -10,6 +10,10 @@
 校验位与真实日期校验。重量 AI（310n/320n）在两种输入下行为完全一致，响应除
 原始 `value` 外还会返回 `decimal_value`（按隐含小数位解释后的数值）与 `unit`。
 
+此外提供 `POST /weight-summary`：批量接收多条扫描，按 **GTIN + 批号** 分组，
+用 `Decimal` 从原始六位值与精度位重建重量并精确累加（`1 lb = 0.45359237 kg`），
+返回每组件数与换算到目标单位（kg/lb）、保留六位小数（half-even 舍入）的总重。
+
 ## 一键启动
 
 ```bash
@@ -228,6 +232,90 @@ curl -X POST http://localhost:8080/parse \
 | `DUPLICATE_AI`         | AI 重复出现，或同时出现在路径与查询参数中（仅 URI）           |
 | `INVALID_PERCENT_ENCODING` | `%XX` 不是合法十六进制转义或不是合法 UTF-8（仅 URI）      |
 
+## 批量重量汇总：`POST /weight-summary`
+
+接收多条扫描串（元素串或 Digital Link URI 均可），按 **GTIN（AI 01）+ 批号
+（AI 10）** 分组汇总净重。每条扫描必须满足：
+
+- **恰好一个** AI 01（GTIN）；
+- **至多一个** AI 10（批号，可缺省）；
+- **恰好一个**重量 AI（`310n` 千克或 `320n` 磅）；
+- 其余 AI（17、21）允许出现但不参与汇总。
+
+重量由解析结果中的**原始六位值与精度位 n** 用 `Decimal` 重建
+（`int(value) / 10^n`，`n > 6` 时同样支持），绝不使用 float
+`decimal_value` 累加；磅按精确系数 `1 lb = 0.45359237 kg` 换算。分组按
+各组在 `scans` 中**首次出现的顺序**返回；每组总数转换到目标单位后再统一
+按**六位小数 half-even（银行家）舍入**。响应中 `total` 为 JSON **字符串**
+（如 `"13.911776"`），以完整保留精度与末尾零；缺少 AI 10 的扫描 `batch`
+为 `null`。
+
+请求（`target_unit` 可选，`"kg"` 或 `"lb"`，默认 `"kg"`；批号为可变长
+AI 10 放在串末，固定长度的 01/重量字段无需分隔符）：
+
+```bash
+curl -X POST http://localhost:8080/weight-summary \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_unit": "kg",
+    "scans": [
+      "0109501101530003310300251310LOT-A",
+      "0109501101530003320200251310LOT-A",
+      "01095011015300033103002513"
+    ]
+  }'
+```
+
+响应 `200 OK`（前两条同 GTIN 同批号合并：2.513 kg + 25.13 lb ≈
+13.911776 kg；第三条无批号，单独成组）：
+
+```json
+{
+  "target_unit": "kg",
+  "groups": [
+    {"gtin": "09501101530003", "batch": "LOT-A", "count": 2, "unit": "kg", "total": "13.911776"},
+    {"gtin": "09501101530003", "batch": null,    "count": 1, "unit": "kg", "total": "2.513000"}
+  ]
+}
+```
+
+换算为磅时设 `"target_unit": "lb"`，`unit` 与 `total` 均以磅返回，例如
+单条 `3103 002513`（2.513 kg）→ `"total": "5.540217"`。`scans` 为空数组时
+返回 `{"target_unit": "kg", "groups": []}`。
+
+### 汇总错误响应
+
+任一条扫描解析失败，或缺少/重复关键 AI，均返回 `422`，`detail` 给出
+`scans` 的**零基下标** `index` 与该条扫描的**原始错误** `error`（结构同
+`/parse` 的错误体）：
+
+```json
+{
+  "detail": {
+    "index": 2,
+    "error": {
+      "error": "INVALID_CHECK_DIGIT",
+      "message": "GTIN check digit mismatch: expected 3, found 4",
+      "offset": 15,
+      "expected": "Mod-10 check digit 3",
+      "found": "4"
+    }
+  }
+}
+```
+
+汇总特有的错误码：
+
+| 错误码             | 触发条件                                                  |
+| ------------------ | --------------------------------------------------------- |
+| `MISSING_GTIN`     | 该条扫描没有 AI 01（GTIN）                                |
+| `MISSING_WEIGHT`   | 该条扫描没有任何 310n/320n 重量 AI                        |
+| `DUPLICATE_AI`     | AI 01 出现多次，或 AI 10 出现多次                         |
+| `DUPLICATE_WEIGHT` | 该条扫描出现两个及以上重量元素（如同时有 310n 和 320n）   |
+
+解析器自身的错误（如 `INVALID_CHECK_DIGIT`、`FIELD_TOO_SHORT`、
+`UNSUPPORTED_AI` 等）会原样放入 `error` 字段返回。
+
 ## 本地开发
 
 ```bash
@@ -240,10 +328,12 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py   # FastAPI 应用与请求/响应模型
-  gs1.py    # GS1 元素串 / Digital Link URI 解析与校验核心
+  main.py    # FastAPI 应用与请求/响应模型（/parse、/weight-summary）
+  gs1.py     # GS1 元素串 / Digital Link URI 解析与校验核心
+  summary.py # /weight-summary：Decimal 重量重建、换算、分组与 half-even 舍入
 tests/
   test_parse.py
+  test_weight_summary.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
